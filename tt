@@ -1,0 +1,203 @@
+package controller;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.time.StopWatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.w3c.dom.Document;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathFactory;
+import java.io.File;
+import java.io.FilenameFilter;
+import java.security.MessageDigest;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class CIEDIPrepopulateChecksumController {
+
+    private static final String Customer_Response = "CUSTOMERRESPONSE";
+    public static String Files_Location = "";
+    private static Logger LOG = LoggerFactory.getLogger(CIEDIPrepopulateChecksumController.class);
+    private static String Node_Hierarchy = "";
+    private static StringBuilder logActivities = null;
+    private static StringBuilder fileActivities = null;
+    private static int totalUpdatedRows = 0;
+    private static int transmissionIdNotFound = 0;
+    private static int invalidFilesCount = 0;
+    CIEDIPrepopulateChecksumService ciediPrepopulateChecksumService;
+
+
+    public static void main(String[] args) {
+
+        CIEDIPrepopulateChecksumController ciediPrepopulateChecksumController = new CIEDIPrepopulateChecksumController();
+        CIEDIPrepopulateChecksumService ciediPrepopulateChecksumService = new CIEDIPrepopulateChecksumService();
+
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+        try {
+            ciediPrepopulateChecksumController.populateTransmissionIds();
+        } catch (InterruptedException e) {
+            LOG.error("Processing threads failed {} ", e.getMessage());
+        }
+        stopWatch.stop();
+
+        LOG.info("Summary of Checksum update operation {} ", fileActivities.toString());
+        LOG.info("Time to prepopulate checksum {} ", stopWatch.toString());
+
+
+    }
+
+    public void setCiediPrepopulateChecksumService(CIEDIPrepopulateChecksumService ciediPrepopulateChecksumService) {
+        this.ciediPrepopulateChecksumService = ciediPrepopulateChecksumService;
+    }
+
+    public void populateTransmissionIds() throws InterruptedException {
+
+        LOG.info("Reading files from archive");
+        logActivities = new StringBuilder();
+        fileActivities = new StringBuilder();
+
+        File dir = new File(Files_Location);
+
+        File[] filteredFiles = filterFiles(dir);
+
+        LOG.info("File count after filtering files with 'CUSTOMERRESPONSE' : {}", filteredFiles.length);
+        fileActivities.append("Files whose checksum is not updated in DB: \n ");
+        logActivities.append("Total no of files processed: ");
+        logActivities.append(filteredFiles.length);
+
+        int emptyFile = 0;
+        ExecutorService executorService = Executors.newFixedThreadPool(6);//Latest
+
+        for (File file : filteredFiles) {
+            if (file.length() == 0) {
+
+                emptyFile++;
+                LOG.info("File: {} is empty ", file.getName());
+                fileActivities.append(file.getName() + " - Empty file\n ");
+
+            } else {
+                executorService.execute(new Task(file, ciediPrepopulateChecksumService));//Latest
+            }
+        }
+
+        executorService.shutdown();
+        executorService.awaitTermination(10, TimeUnit.MINUTES);
+
+        logActivities.append(", Total Transmission Checksum updated: ");
+        logActivities.append(totalUpdatedRows);
+        logActivities.append(", Files whose Checksum not updated to DB: ");
+        logActivities.append(transmissionIdNotFound);
+        logActivities.append(", Empty files count: ");
+        logActivities.append(emptyFile);
+        logActivities.append(", Invalid files count: ");
+        logActivities.append(invalidFilesCount);
+        LOG.info("Transmission Checksum update summary: {} ", logActivities.toString());
+
+    }
+
+    private void processTransmissionId(File file) {
+
+        LOG.info("File {} is ready for DOM and XPATH operations", file.getName());
+
+        String transmissionId = fetchTransmissionId(file);
+        String checksumId = null;
+
+        try {
+            if (StringUtils.isNotBlank(transmissionId)) {
+
+                LOG.info("File {} completed XPath traverse ", file.getName());
+
+                MessageDigest md5Digest = MessageDigest.getInstance("MD5");
+                CheckSum checkSum = new CheckSum();
+                checksumId = checkSum.getFileCheckSum(md5Digest, file);
+
+                if (StringUtils.isNotBlank(checksumId)) {
+
+                    TransmissionCO transmissionCO = new TransmissionCO();
+                    transmissionCO.setTransmissionId(transmissionId);
+                    transmissionCO.setTransmissionChecksum(checksumId);
+
+                    int updatedRows = ciediPrepopulateChecksumService.updateChecksum(transmissionCO);
+
+                    if (updatedRows >= 1) {
+
+                        totalUpdatedRows = totalUpdatedRows + updatedRows;
+                        LOG.info("Updated {} rows for file {} with transmission id {} and checksum {}", updatedRows, file.getName(), transmissionId, checksumId);
+                    } else {
+                        transmissionIdNotFound++;
+                        fileActivities.append(file.getName() + "\n ");
+                        LOG.info("No rows updated for file {} with transmission id {} and checksum {}", file.getName(), transmissionId, checksumId);
+
+                    }
+                } else {
+                    LOG.info("File {} with Transmission ID {} has no checksum value ", file.getName(), transmissionId);
+                    transmissionIdNotFound++;
+                    fileActivities.append(file.getName() + "\n");
+
+                }
+
+            } else {
+                transmissionIdNotFound++;
+                fileActivities.append(file.getName() + "\n ");
+            }
+        } catch (Exception e) {
+            LOG.error("Exception while getting the checksum: {} ", e.getMessage());
+        }
+
+    }
+
+    public File[] filterFiles(File file) {
+        return file.listFiles(new FilenameFilter() {
+            @Override
+            public boolean accept(File dir, String name) {
+                return !name.toUpperCase().contains(Customer_Response);
+            }
+        });
+    }
+
+    private String fetchTransmissionId(File file) {
+        String transmissionId = null;
+        try {
+            DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
+            DocumentBuilder documentBuilder = documentBuilderFactory.newDocumentBuilder();
+            Document document = documentBuilder.parse(file);
+
+            LOG.info("File {} completed DOM parsing", file.getName());
+
+            XPathFactory xPathFactory = XPathFactory.newInstance();
+            XPath xPath = xPathFactory.newXPath();
+            transmissionId = xPath.evaluate(Node_Hierarchy, document);
+
+
+        } catch (Exception e) {
+
+            LOG.error("File {} Failed to fetch from XML {} ", file.getName(), e.getMessage());
+        }
+        return transmissionId;
+    }
+
+    static class Task implements Runnable {
+
+        File file;
+        CIEDIPrepopulateChecksumService service;
+
+        public Task(File file, CIEDIPrepopulateChecksumService service) {
+            this.file = file;
+            this.service = service;
+        }
+
+
+        @Override
+        public void run() {
+            CIEDIPrepopulateChecksumController ciediPrepopulateChecksumController = new CIEDIPrepopulateChecksumController();
+            ciediPrepopulateChecksumController.setCiediPrepopulateChecksumService(service);
+            ciediPrepopulateChecksumController.processTransmissionId(file);
+        }
+    }
+
+}
